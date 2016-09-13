@@ -16,7 +16,7 @@ import Control.Monad
 import Data.Foldable
 import qualified Control.Monad.Trans.Class as TC
 
-import qualified Data.Map as M
+import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 
 import CES.Data
