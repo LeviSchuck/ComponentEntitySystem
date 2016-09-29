@@ -1,19 +1,20 @@
-module CES.Data where
+module CES.Data
+    ( CESContext
+    , ComponentID
+    , ComponentClass(..)
+    , ComponentPhantom(..)
+    , defCES
+    , CESReturn(..)
+    )
+where
 
 import qualified Data.Map as M
-import qualified Data.Set as S
 
-type ComponentID = Int
-
-data CESContext c = CESContext
-    { cesNextID :: ComponentID
-    , entities :: M.Map c (S.Set ComponentID)
-    }
-    deriving (Show)
+import CES.Data.Internal
 
 defCES = CESContext
-    { cesNextID = 1
+    { cesNextID = ComponentID 1
     , entities = M.empty
     }
 
-
+type CESReturn a = Either (Maybe String) a
