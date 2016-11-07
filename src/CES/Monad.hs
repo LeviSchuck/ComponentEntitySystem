@@ -1,199 +1,92 @@
 {-# LANGUAGE LambdaCase #-}
-module CES.Monad
-    ( CEST(..)
-    , newEntity
-    , addComponent
-    , remComponent
-    , onEntities
-    , foldEntities
-    , onEntity
-    , onEntity_
-    , runCEST
-    , execCEST
-    , evalCEST
-    , ces
-    , cesM
-    -- Reexport lift
-    , TC.lift
-    )
-where
+module CES.Monad where
+{- TODO: reexport TC.lift -}
 
 import Control.Applicative
 import Control.Monad
 import Data.Foldable
-import Unsafe.Coerce
+import Data.Typeable
+
+-- import Debug.Trace
 
 import qualified Control.Monad.Trans.Class as TC
+import qualified Control.Monad.IO.Class as IOC
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 
-import CES.Data
-import CES.Data.Internal
+import qualified CES.Data.Internal as DI
 
-newtype CEST m v = CEST
-    { runCEST' :: CESContext -> m (CESRet v, CESContext)
-    }
+newtype CESMonad t m a = CESMonad { runCES :: DI.CESContext t -> m (a, DI.CESContext t) }
 
-instance (Functor m) => Functor (CEST m) where
-    fmap f m = CEST $ \ s ->
-        fmap (\ ~(a, s') -> (fmap f a, s')) $ runCEST' m s
-    {-# INLINE fmap #-}
+instance TC.MonadTrans (CESMonad t) where
+  lift m = CESMonad $ \ ctx -> do
+    a <- m
+    return (a, ctx)
+  {-# INLINE lift #-}
 
-instance (Functor m, Monad m) => Applicative (CEST m) where
-    pure x = CEST $ \s -> (return (NormalRet x, s))
-    {-# INLINE pure #-}
-    m <*> n = CEST $ \s -> runCEST' m s >>= \case
-        (VoidRet, s)      -> return (VoidRet, s)
-        (FailureRet x, s) -> return (FailureRet x, s)
-        (NormalRet f, s)  -> runCEST' n s >>= \case
-            (VoidRet, s')      -> return (VoidRet, s') 
-            (FailureRet x, s') -> return (FailureRet x, s')
-            (NormalRet v, s')  -> return (NormalRet (f v), s')
-    {-# INLINE (<*>) #-}
+instance (IOC.MonadIO m) => IOC.MonadIO (CESMonad t m) where
+  liftIO = TC.lift . IOC.liftIO
+  {-# INLINE liftIO #-}
 
-instance (Monad m) => Monad (CEST m) where
-    fail str = CEST $ \s -> return (FailureRet str, s)
-    {-# INLINE fail #-}
-    return a = CEST $ \s -> return (NormalRet a, s)
-    {-# INLINE return #-}
-    m >>= k  = CEST $ \s -> do
-        ~(a, s') <- runCEST' m s
-        case a of
-            VoidRet      -> return (VoidRet, s)
-            FailureRet r -> return (FailureRet r, s)
-            NormalRet v  -> runCEST' (k v) s'
-    {-# INLINE (>>=) #-}
-    
-instance (Functor m, Monad m) => Alternative (CEST m) where
-    empty = CEST $ \s -> return (VoidRet, s)
-    {-# INLINE empty #-}
-    m <|> n = CEST $ \s -> runCEST' m s >>= \case
-        (VoidRet, s')     -> runCEST' n s'
-        (FailureRet _, _) -> runCEST' n s
-        (NormalRet v, s') -> return (NormalRet v, s')
-    {-# INLINE (<|>) #-}
+instance (Functor m) => Functor (CESMonad t m) where
+  fmap f m = CESMonad $ \ ctx ->
+    fmap (\ (a, ctx') -> (f a, ctx')) $ runCES m ctx
+  {-# INLINE fmap #-}
 
-instance (MonadPlus m) => MonadPlus (CEST m) where
-    mzero       = CEST $ \s -> return (VoidRet, s)
-    {-# INLINE mzero #-}
-    m `mplus` n = CEST $ \s -> do
-        ~(a, s') <- runCEST' n s
-        case a of
-            VoidRet -> runCEST' n s'
-            FailureRet _ -> runCEST' n s'
-            NormalRet r -> return (NormalRet r, s')
-    {-# INLINE mplus #-}
+instance (Functor m, Monad m) => Applicative (CESMonad t m) where
+  pure a = CESMonad $ \ ctx -> return (a, ctx)
+  {-# INLINE pure #-}
+  CESMonad mf <*> CESMonad mx = CESMonad $ \ ctx -> do
+    (f, ctx') <- mf ctx
+    (x, ctx'') <- mx ctx'
+    return (f x, ctx'')
+  {-# INLINE (<*>) #-}
 
-instance TC.MonadTrans CEST where
-    lift m = CEST $ \s -> do
-        a <- m
-        return (NormalRet a, s)
-    {-# INLINE lift #-}
+instance (Monad m) => Monad (CESMonad t m) where
+  return a = CESMonad $ \ ctx -> return (a, ctx)
+  {-# INLINE return #-}
+  m >>= k  = CESMonad $ \ ctx -> do
+    (a, ctx') <- runCES m ctx
+    runCES (k a) ctx'
+  {-# INLINE (>>=) #-}
+  fail str = CESMonad $ \ _ -> fail str
+  {-# INLINE fail #-}
 
-ces :: (Monad m)
-      => (CESContext -> (CESReturn a, CESContext)) 
-      -> CEST m a
-ces f = CEST $ \s -> case f s of
-    (Left Nothing, _)    -> return (VoidRet, s)
-    (Left (Just str), _) -> return (FailureRet str, s)
-    (Right a, s)         -> return (NormalRet a, s)
+
+ces :: (Monad m) => (DI.CESContext t -> (a, DI.CESContext t)) -> CESMonad t m a
+ces f = CESMonad (return . f)
 {-# INLINE ces #-}
 
-cesM :: (Monad m)
-      => (CESContext -> m (CESReturn a, CESContext)) 
-      -> CEST m a
-cesM f = CEST $ \s -> f s >>= \case
-    (Left Nothing, _)    -> return (VoidRet, s)
-    (Left (Just str), _) -> return (FailureRet str, s)
-    (Right a, s)         -> return (NormalRet a, s)
-{-# INLINE cesM #-}
+new :: (Monad m) => CESMonad t m DI.EntityID
+new = ces DI.nextEntity
 
-runCEST :: (Monad m) => CEST m a -> CESContext -> m (CESReturn a, CESContext)
-runCEST m c = do
-    ~(a, c') <- runCEST' m c
-    case a of
-        VoidRet -> return (Left Nothing, c)
-        FailureRet str -> return (Left (Just str), c)
-        NormalRet a -> return (Right a, c')
-{-# INLINE runCEST #-}
+kill :: (Monad m) => DI.EntityID -> CESMonad t m ()
+kill ent = ces (DI.killEntity ent) >>= \case
+  DI.Success -> return ()
+  f -> fail (DI.err f)
 
-execCEST :: (Monad m) => CEST m a -> CESContext -> m CESContext
-execCEST m c = runCEST m c >>= return . snd
-{-# INLINE execCEST #-}
+get :: (Monad m, DI.CESType t, Typeable d) => DI.EntityID -> t -> CESMonad t m (Maybe d)
+get ent ty = ces (DI.getEntityType ent ty) >>= \case
+  (DI.Success, x) -> return x
+  (DI.NoData, _) -> return Nothing
+  (f, _) -> fail (DI.err f)
 
-evalCEST :: (Monad m) => CEST m a -> CESContext -> m (CESReturn a)
-evalCEST m c = runCEST m c >>= return . fst
-{-# INLINE evalCEST #-}
+has :: (Monad m, DI.CESType t) => DI.EntityID -> t -> CESMonad t m Bool
+has ent ty = ces (DI.hasEntityType ent ty) >>= \case
+  (DI.Success, x) -> return x
+  (f, _) -> fail (DI.err f)
 
-newEntity :: (Monad m) => CEST m ComponentID
-newEntity = ces (\c -> (Right (cesNextID c), c {cesNextID = (ComponentID (getCompID (cesNextID c) + 1))}))
-{-# INLINE newEntity #-}
+add :: (Monad m, DI.CESType t, Typeable d) => DI.EntityID -> t -> d -> CESMonad t m ()
+add ent ty dat = ces (DI.addEntityType ent ty dat) >>= \case
+  DI.Success -> return ()
+  f -> fail (DI.err f)
 
-addComponent :: (Monad m, ComponentPhantom a) => a -> ComponentID -> ComponentType a -> CEST m ()
-addComponent comp eid entity = ces (\c -> (Right (), c
-    { entities = M.alter (\case
-        Nothing -> Just (M.singleton eid (unsafeCoerce entity))
-        Just m -> Just (M.insert eid (unsafeCoerce entity) m)
-        ) (ComponentClass comp) (entities c)
-    }))
-{-# INLINEABLE addComponent #-}
+set :: (Monad m, DI.CESType t, Typeable d) => DI.EntityID -> t -> d -> CESMonad t m ()
+set ent ty dat = ces (DI.setEntityType ent ty dat) >>= \case
+  DI.Success -> return ()
+  f -> fail (DI.err f)
 
-remComponent :: (Monad m, ComponentPhantom a) => a -> ComponentID -> CEST m ()
-remComponent comp entity = ces (\c -> (Right (), c 
-    { entities = M.alter (\case
-        Nothing -> Nothing
-        Just s -> Just (M.delete entity s)
-        ) (ComponentClass comp) (entities c)
-    }))
-{-# INLINE remComponent #-}
-
-onEntities :: (Monad m, ComponentPhantom a) => a -> (ComponentID -> ComponentType a -> CEST m ()) -> CEST m ()
-onEntities comp on = CEST (\c -> case M.lookup (ComponentClass comp) (entities c) of
-        Nothing -> return (NormalRet (), c)
-        Just m -> do
-            (_, c') <- runCEST' (mapM_ (\(k,v) -> on k (unsafeCoerce v)) (M.toList m)) c
-            return (NormalRet (), c')
-    )
-{-# INLINABLE onEntities #-}
-
-foldEntities :: (Monad m, ComponentPhantom a) => a -> b -> (b -> ComponentID -> ComponentType a -> CEST m b) -> CEST m b
-foldEntities comp d on = CEST (\c -> case M.lookup (ComponentClass comp) (entities c) of
-        Nothing -> return (NormalRet d, c)
-        Just m -> do
-            (r, c') <- runCEST' (foldM (\d' (k,v) -> on d' k (unsafeCoerce v)) d (M.toList m)) c
-            case r of
-                VoidRet -> return (VoidRet, c)
-                FailureRet str -> return (FailureRet str, c)
-                NormalRet r -> return (NormalRet r, c')
-    )
-{-# INLINABLE foldEntities #-}
-
-onEntity :: (Monad m, ComponentPhantom a) => a -> ComponentID -> (ComponentType a -> CEST m (Maybe (ComponentType a))) -> CEST m ()
-onEntity comp entity on = CEST (\c -> case M.lookup (ComponentClass comp) (entities c) of
-    Nothing -> return (VoidRet, c)
-    Just m -> case M.lookup entity m of
-        Nothing -> return (VoidRet, c)
-        Just x -> runCEST' (on (unsafeCoerce x)) c >>= \case
-            (VoidRet, _) -> return (VoidRet, c)
-            (FailureRet str, _) -> return (FailureRet str, c)
-            (NormalRet Nothing, c') -> return (NormalRet (), c' {entities = M.alter (\case
-                Nothing -> Nothing
-                Just cs -> Just (M.delete entity cs)
-                ) (ComponentClass comp) (entities c')})
-            (NormalRet (Just nv), c') -> return (NormalRet (), c' {entities = M.alter (\case
-                Nothing -> Just (M.singleton entity (unsafeCoerce nv))
-                Just cs -> Just (M.insert entity (unsafeCoerce nv) cs)
-                ) (ComponentClass comp) (entities c')})
-    )
-
-onEntity_ :: (Monad m, ComponentPhantom a) => a -> ComponentID -> (ComponentType a -> CEST m ()) -> CEST m ()
-onEntity_ comp entity on = CEST (\c -> case M.lookup (ComponentClass comp) (entities c) of
-    Nothing -> return (VoidRet, c)
-    Just m -> case M.lookup entity m of
-        Nothing -> return (VoidRet, c)
-        Just x -> runCEST' (on (unsafeCoerce x)) c >>= \case
-            (VoidRet, _) -> return (VoidRet, c)
-            (FailureRet str, _) -> return (FailureRet str, c)
-            (NormalRet (), c') -> return (NormalRet (), c')
-    )
-{-# INLINABLE onEntity_ #-}
+remove :: (Monad m, DI.CESType t) => DI.EntityID -> t -> CESMonad t m ()
+remove ent ty = ces (DI.killEntityType ent ty) >>= \case
+  DI.Success -> return ()
+  f -> fail (DI.err f)
